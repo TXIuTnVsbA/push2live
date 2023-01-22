@@ -2,74 +2,96 @@ import subprocess
 import time
 import os
 import json
+import random
 from utils.blivex import Bilibili
-
 bili = Bilibili()
 bili.login_with_cookie('./data/cookie.json')
-
 video_file = './data/videos.json'
+mtime = os.stat(video_file).st_mtime
+with open(video_file, 'r') as v_f:
+    live_list = json.load(v_f)
+    
+file_list = []
+for p in live_list['path']:
+    f_li = [x for x in os.listdir(p) if (os.path.splitext(x)[1] == '.mp4')]
+    file_list.extend( p+x for x in f_li)
+
+i = 0
+retry = 0
+high = len(file_list) - 1
 
 while not bili.info["live_status"]:
     bili.start_live()
-    time.sleep(5)
+    time.sleep(1)
     bili.get_user_info()
 
 rtmp_addr = bili.get_rtmp()
 
-with open(video_file, 'r') as v_f:
-    live_list = json.load(v_f)
-
-file_list = []
-cursor = int(live_list['cursor'])
-
-for p in live_list['path']:
-    f_li = [x for x in os.listdir(p) if (os.path.splitext(x)[1] == '.mp4')]
-    f_li = sorted(f_li, key=lambda a: int(a[:-4]))
-    file_list.extend( p+x for x in f_li)
-
-pushList = file_list[cursor:] + file_list[:cursor] # 整合播放列表
-
-startpoint = live_list['ss_time']
-
-i = 0
-retry = 0 # 断开重连计数器
-
 while True:
-    log_file = open('./data/live.log', 'a')
-    e_start = time.time()
-    log_content = (f"[{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(time.time()))}]  {pushList[i]}")
-    log_file.write(log_content + "\n")
-    log_file.close()
+    if mtime != os.stat(video_file).st_mtime:
+        log_file = open('./data/live.log', 'a')
+        e_start = time.time()
+        log_content = (f"[{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(time.time()))}]  change:\"{video_file}\",refresh")
+        log_file.write(log_content + "\n")
+        log_file.close()
+        mtime = os.stat(video_file).st_mtime
+        with open(video_file, 'r') as v_f:
+            live_list = json.load(v_f)
+        file_list = []
+        for p in live_list['path']:
+            f_li = [x for x in os.listdir(p) if (os.path.splitext(x)[1] == '.mp4')]
+            file_list.extend( p+x for x in f_li)
+        i = 0
+        retry = 0
+        high = len(file_list) - 1
 
-    p = subprocess.Popen(f'ffmpeg -hide_banner -re -ss {startpoint} -fflags +genpts+igndts+ignidx+nobuffer+flush_packets -i {pushList[i]} -c copy -shortest -probesize 32 -max_interleave_delta 0 -use_wallclock_as_timestamps 1 -flush_packets 1 -flvflags +no_sequence_end+no_metadata+no_duration_filesize -f flv \"{rtmp_addr}\"', shell=True)
-    p.wait()
-
-    e_end = time.time()
-    playtime = int(startpoint[3:5]) * 60 + int(startpoint[6:8]) + (e_end - e_start) # 计算单集视频的播放时长
-
-    if retry == 5: # 超过重连次数，关闭直播间
-        bili.stop_live()
-        live_list['ss_time'] = startpoint
-        with open(video_file, 'w') as w_f:
-            json.dump(live_list, w_f, ensure_ascii=False)
+    if retry > 4:
+        log_file = open('./data/live.log', 'a')
+        e_start = time.time()
+        log_content = (f"[{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(time.time()))}]  retry:{retry},break")
+        log_file.write(log_content + "\n")
+        log_file.close()
         break
 
-    if playtime < 2100: # 如果单集播放时长不足 35 分钟 2100 s = 35 min，则认为直播被断开，开始重启直播间
-        bili.get_user_info()
-        if not bili.info["live_status"]:
-            bili.stop_live()
-            time.sleep(300 * retry) # 每次断开，重连时间为 5 min 的倍数
-            bili.start_live()
-        retry = retry + 1
-        startpoint = time.strftime('%H:%M:%S', time.gmtime(playtime)) # 计算上次播放位置
-        continue
+    if retry > 2:
+        bili = Bilibili()
+        bili.login_with_cookie('./data/cookie.json')
+        bili.stop_live()
+        time.sleep(1)
+        bili.start_live()
+        time.sleep(1)
+        rtmp_addr = bili.get_rtmp()
+        bili.send_dm("BOT:尝试重新连接成功，直播继续")
+        log_file = open('./data/live.log', 'a')
+        e_start = time.time()
+        log_content = (f"[{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(time.time()))}]  retry:{retry},net_work,retry_login_live,retry_get_rtmp:{rtmp_addr}")
+        log_file.write(log_content + "\n")
+        log_file.close()
 
-    i += 1
-    startpoint = '00:00:00'
-    retry = 0
-    live_list['cursor'] = (cursor + i) % len(pushList)
-    live_list['ss_time'] = startpoint
-    with open(video_file, 'w') as w_f:
-        json.dump(live_list, w_f, ensure_ascii=False)
-    if i == len(pushList):
-        i = 0
+    i = random.randint(0, high)
+    log_file = open('./data/live.log', 'a')
+    e_start = time.time()
+    log_content = (f"[{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(time.time()))}]  push:{file_list[i]}")
+    log_file.write(log_content + "\n")
+    log_file.close()
+    returncode = subprocess.Popen(f'ffmpeg -re -i {file_list[i]} -threads 8 -preset ultrafast -c copy -flvflags no_duration_filesize -f flv \"{rtmp_addr}\"', shell=True).wait()
+    if returncode:
+        retry += 1
+        ping = 1
+        log_file = open('./data/live.log', 'a')
+        e_start = time.time()
+        log_content = (f"[{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(time.time()))}]  push_error,try_ping")
+        log_file.write(log_content + "\n")
+        log_file.close()
+        while ping:
+            ping = subprocess.Popen(f'ping live-push.bilivideo.com -c 1', shell=True).wait()
+            time.sleep(1)
+        rtmp_addr = bili.get_rtmp()
+        log_file = open('./data/live.log', 'a')
+        e_start = time.time()
+        log_content = (f"[{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(time.time()))}]  retry:{retry},net_work,retry_get_rtmp:{rtmp_addr}")
+        log_file.write(log_content + "\n")
+        log_file.close()
+        
+    else:
+        retry = 0
